@@ -1,0 +1,993 @@
+Datas_validas:
+Load
+	DAT_CALENDARIO_CIVIL
+FROM [$(vGlobalDirDadoTransformado)\Dim_Calendario_Comercial.qvd] (qvd)
+where DAT_CALENDARIO_CIVIL >= date(AddMonths(today(),-2)) and DAT_CALENDARIO_CIVIL <= today();
+
+//Controle de remessas já embarcadas
+tmp_Embarcadas:
+LOAD 
+	COD_REMESSA as VBELN_FILTRO,
+	DAT_EMBARQUE_CARGA //as ERDAT
+from [lib://CNNDIR-Dados/Transformados/LOG-LEADTIME/FATO_REMESSAS.qvd](qvd)
+Where Exists(DAT_CALENDARIO_CIVIL,DAT_EMBARQUE_CARGA);
+
+concatenate(tmp_Embarcadas)
+Load
+	VBELV as VBELN_FILTRO,
+    ERDAT as ERDAT_VBFA
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/VBFA.qvd](qvd)
+where BWART = '861';
+
+concatenate(tmp_Embarcadas)
+Load
+	VBELN as VBELN_FILTRO,
+    ERDAT as ERDAT_VTTP
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/VTTP.qvd](qvd);
+
+NoConcatenate
+Embarcadas:
+Load
+	VBELN_FILTRO,
+    alt(max(DAT_EMBARQUE_CARGA), min(ERDAT_VTTP), max(ERDAT_VBFA)) as ERDAT
+resident tmp_Embarcadas
+group by 
+	VBELN_FILTRO;
+
+MapCDAbastecedor:
+Mapping load 
+    WERKS as %CENTRO_CHAVE,
+    CDDEST as CD_ABASTECEDOR
+from [$(vGlobalDirDadoExtraidoSAPECC)/ZWMUCT007.qvd] (qvd)
+where trim(CDDEST) <> '';
+
+Map_Remessa:
+mapping Load
+    VGBEL as EBELN,
+    VBELN
+FROM [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/LIPS.qvd] (qvd)
+Where Exists(DAT_CALENDARIO_CIVIL,ERDAT) and len(trim(VGBEL)) >0;
+
+MapArvore:
+mapping load distinct
+    COD_MATERIAL						AS COD_MATERIAL,
+    COD_SUB_GRUPO 						AS %ARVORE_CHAVE
+FROM [$(vGlobalDirDadoTransformado)/Dim_Arvore_Mercadologica.qvd] (qvd);
+
+MapPlanoProducao:
+Mapping load * inline [
+Deposito, 		Grupo
+PUSH & PULL,	P&P
+CROSS, 			CALÇADOS
+BUFFER, 		CALÇADOS
+ACESSÓRIOS, 	ACESSÓRIOS
+];
+
+vBotaoMedida:
+load * inline [
+Tipo_medida, 	Cód_medida
+Peças/Pares,	1
+Volume, 		2
+Remessas, 		3
+];
+
+NoConcatenate
+EBAN:
+Load
+    LOEKZ,
+    BSART,
+    MENGE,
+    WERKS,
+    RESWK,
+    CREATIONDATE,
+    BANFN,
+    EBELN,
+    EBELN as filtro_buffer,
+    ApplyMap('Map_Remessa',EBELN,null()) as VBELN,
+	MATNR
+from [lib://CNNDIR-DadosDEV/Temporários/Pablo_Projjetta/Extraidos/EBAN.qvd](qvd)
+where LOEKZ <> 'X' and match(BSART,'ZBF','ZMD','ZFT','ZSKU')  AND Exists(DAT_CALENDARIO_CIVIL,CREATIONDATE);
+
+Map_destino:
+Mapping load
+	BANFN,
+	WERKS
+resident EBAN;
+
+Map_Requisicao:
+mapping Load
+    EBELN,
+    BANFN
+resident EBAN;
+
+Map_producao:
+mapping load
+	BANFN as [Número da requisição],
+    count(distinct EBELN) as NUM_PEDIDOS_REQUISICAO
+resident EBAN
+where trim(EBELN) <> ''
+group by
+	BANFN;
+
+// Map_qtd_requisicao:
+// mapping load
+// 	BANFN&'|'&MATNR&'|'&RESWK as [%CHAVE_REQUISICAO],
+//     sum(MENGE) as QTD_TOTAL_REQUISICAO
+// resident EBAN
+// group by
+// 	BANFN,
+//     MATNR,
+//     RESWK;
+
+drop table Datas_validas;
+
+TMP_FATO:
+Load
+	Null() as %DATA_CHAVE
+AutoGenerate 0;
+
+/*************
+//BUFFER E ACESSÓRIOS
+*************/
+
+//À embarcar
+FINALIZADO:
+NoConcatenate
+Load 
+    VGBEL as [Número do Pedido],
+    VBELN as [Número da remessa],
+	ApplyMap('Map_Requisicao',VGBEL, null()) as [Número da requisição],
+    WERKS as [CD ORIGEM],
+	LFIMG as QTD,
+    LFIMG as QTD_FINALIZADO,
+    MATNR as %MATERIAL_CHAVE,
+    'À EMBARCAR' as TIPO
+FROM [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/LIPS.qvd] (qvd)
+Where Exists(filtro_buffer, VGBEL) and match(PSTYV ,'YFDP','YSDP');
+
+NoConcatenate
+LTAK:
+Load
+	text(VBELN) as [Número da remessa],
+    BDATU as [%DATA_CHAVE],
+    TANUM
+FROM [lib://CNNDIR-DadosDEV/Temporários/Pablo_Projjetta/Extraidos/LTAK.qvd](qvd);
+
+Inner join (LTAK)
+Load
+	TANUM
+from [lib://CNNDIR-DadosDEV/Temporários/Pablo_Projjetta/Extraidos/LTAP.qvd](qvd)
+where NISTM >0;
+
+left join (FINALIZADO)
+Load Distinct
+	[Número da remessa],
+	date(max([%DATA_CHAVE])) as [%DATA_CHAVE]
+resident LTAK
+group by [Número da remessa];
+drop table LTAK;
+
+Inner join (FINALIZADO)
+Load
+	text(VBELN) as [Número da remessa]
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/VBUK.qvd](qvd)
+where match(trim(LVSTK), 'C');
+
+Concatenate (TMP_FATO)
+Load 
+	[Número da requisição],
+	[Número do Pedido],
+    [Número da remessa],
+    [Número da remessa] as [Remessa Finalizada],
+    %MATERIAL_CHAVE,
+    QTD_FINALIZADO,
+	QTD,
+    [CD ORIGEM],
+    TIPO,
+    [%DATA_CHAVE] as DAT_FINALIZADO,
+    [%DATA_CHAVE]
+resident FINALIZADO
+where not Exists(VBELN_FILTRO, [Número da remessa]);
+
+NoConcatenate
+EMBARCADO:
+// Concatenate (TMP_FATO)
+Load 
+	[Número da requisição],
+	[Número do Pedido],
+    [Número da remessa],
+    [Número da remessa] as [Remessa Embarcada],
+    %MATERIAL_CHAVE,
+    QTD as QTD_EMBARCADO,
+	QTD,
+    [CD ORIGEM],
+    [%DATA_CHAVE] as DAT_FINALIZADO,
+    'EMBARCADO' as TIPO
+resident FINALIZADO
+where Exists(VBELN_FILTRO, [Número da remessa]);
+
+drop table FINALIZADO;
+
+inner join (EMBARCADO)
+Load 
+	VBELN_FILTRO as [Número da remessa],
+    min(ERDAT) as %DATA_CHAVE,
+    date(min(ERDAT)) as DAT_EMBARCADO
+resident Embarcadas
+group by VBELN_FILTRO;
+
+Concatenate (TMP_FATO)
+Load *
+resident EMBARCADO;
+drop table EMBARCADO;
+
+//Produção
+
+PROD:
+NoConcatenate
+Load 
+    VGBEL as [Número do Pedido],
+    VBELN as [Número da remessa],
+    ApplyMap('Map_Requisicao',VGBEL, null()) as [Número da requisição],
+    LFIMG as QTD_PRODUCAO,
+	LFIMG as QTD,
+    MATNR as %MATERIAL_CHAVE,
+    WERKS as [CD ORIGEM],
+    date(ERDAT,'DD/MM/YYYY') as [%DATA_CHAVE],
+    date(ERDAT) as DAT_PRODUCAO,
+    'PRODUÇÃO' as TIPO
+FROM [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/LIPS.qvd] (qvd)
+Where Exists(filtro_buffer, VGBEL) and match(PSTYV,'YFDP','YSDP') and not Exists([Remessa Finalizada], VBELN) and not Exists([Remessa Embarcada], VBELN);
+
+Inner join (PROD)
+Load
+	text(VBELN) as [Número da remessa]
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/VBUK.qvd](qvd)
+where not match(trim(LVSTK), 'C',''); //LVSTA
+
+Concatenate (TMP_FATO)
+Load 
+	[Número da requisição],
+	[Número do Pedido],
+    [Número da remessa],
+    [Número da remessa] as [Remessa Produção],
+    %MATERIAL_CHAVE,
+	QTD,
+    QTD_PRODUCAO,
+    [CD ORIGEM],
+    TIPO,
+    DAT_PRODUCAO,
+    [%DATA_CHAVE]
+resident PROD;
+
+drop table PROD;
+
+//REQUISIÇÕES
+
+Concatenate(TMP_FATO)
+Load 
+    LOEKZ,
+//     BSART,
+   	MENGE as QTD_SOLICITADA,
+   	MENGE as QTD,
+//     WERKS as [%CENTRO_CHAVE],
+    RESWK as [CD ORIGEM],
+    MATNR as %MATERIAL_CHAVE,
+    'REQUISIÇÃO' as TIPO,
+    date(CREATIONDATE,'DD/MM/YYYY') as [%DATA_CHAVE],
+	date(CREATIONDATE) as DAT_CRIACAO,
+    VBELN as [Número da remessa],
+    BANFN as [Número da requisição],
+    EBELN as [Número do Pedido],
+	EBELN as filtro_buffer
+resident EBAN
+where not Exists([Remessa Finalizada], VBELN) 
+      and not Exists([Remessa Embarcada], VBELN) 
+      and not Exists([Remessa Produção], VBELN)   
+      and ((ApplyMap('Map_producao', BANFN, 0) > 0 and not match(Trim(VBELN), '', null())) or ApplyMap('Map_producao', BANFN, 0) = 0); //Se existir pedido para a requisicao exclui remessas sem pedido
+
+// drop table EBAN;
+drop Field filtro_buffer, [Remessa Finalizada], [Remessa Embarcada], [Remessa Produção];
+
+
+/**************************
+PUSH AND PULL
+**************************/
+// Concatenate (TMP_FATO)
+REMESSAS_FINALIZADAS:
+Load
+	text(VBELN) as [REMESSA_FINALIZADA]
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/VBUK.qvd](qvd)
+where match(trim(LVSTK), 'C');
+
+REMESSAS_PP:
+LOAD
+    COD_MATERIAL                        AS %MATERIAL_CHAVE,
+    Floor(DAT_REFERENCIA)               as [%DATA_CHAVE],
+    COD_PEDIDO_COMPRA                  	as [Número do Pedido],
+    COD_REMESSA_ORIGEM                 	as [Número da remessa],    
+    Text(COD_CENTRO)                    as [CD ORIGEM],
+    QTD_ARMAZENAGEM                    	as QTD
+FROM [lib://CNNDIR-Dados/Transformados/LOG-PUSHANDPULL/FATO_ARMAZENAGEM.qvd] (qvd)
+where Exists([Número da remessa],COD_REMESSA_ORIGEM) and not Exists(VBELN_FILTRO, COD_REMESSA_ORIGEM);
+
+Concatenate (TMP_FATO)
+Load 
+	*,
+    [%DATA_CHAVE]						as DAT_FINALIZADO,
+	QTD                    				as QTD_FINALIZADO,
+    'PP' 								as AUX,
+    'À EMBARCAR' 						as TIPO
+resident REMESSAS_PP
+where Exists([REMESSA_FINALIZADA], [Número da remessa]);
+
+Concatenate (TMP_FATO)
+Load 
+	*,
+    [%DATA_CHAVE]						as DAT_PRODUCAO,
+	QTD                    				as QTD_PRODUCAO,
+    'PP' 								as AUX,
+    'PRODUÇÃO' 							as TIPO
+resident REMESSAS_PP
+where not Exists([REMESSA_FINALIZADA], [Número da remessa]);
+
+drop table REMESSAS_PP, REMESSAS_FINALIZADAS;
+
+Concatenate (TMP_FATO)
+// EMBARCADO:
+Load 
+	ApplyMap('Map_Requisicao',COD_PEDIDO_COMPRA, null()) as [Número da requisição],
+	date(Floor(DAT_REFERENCIA))               as DAT_EMBARCADO,
+    DAT_FIM_ARMAZENAGEM 				as DAT_FINALIZADO,
+	COD_PEDIDO_COMPRA                  	as [Número do Pedido],
+    COD_REMESSA_ORIGEM                 	as [Número da remessa], 
+    COD_MATERIAL            AS %MATERIAL_CHAVE,
+    QTD_ARMAZENAGEM 		as QTD_EMBARCADO,
+	QTD_ARMAZENAGEM 		as QTD,
+    Text(COD_CENTRO)        as [CD ORIGEM],
+    'EMBARCADO' as TIPO,
+    'PP' 		as AUX
+FROM [lib://CNNDIR-Dados/Transformados/LOG-PUSHANDPULL/FATO_ARMAZENAGEM.qvd] (qvd)
+where Exists([Número do Pedido],COD_PEDIDO_COMPRA) and Exists(VBELN_FILTRO, COD_REMESSA_ORIGEM);
+
+// inner join (EMBARCADO)
+// Load 
+// 	VBELN_FILTRO as [Número da remessa],
+//     min(ERDAT) as %DATA_CHAVE
+// resident Embarcadas
+// group by VBELN_FILTRO;
+
+// Concatenate (TMP_FATO)
+// Load *
+// resident EMBARCADO;
+// drop table EMBARCADO;
+
+NoConcatenate
+tmp_qtd_embarcado:
+Load
+	[Número da requisição]&'|'&%MATERIAL_CHAVE as [%CHAVE_REQUISICAO],
+    sum(QTD_EMBARCADO) as QTD_TOTAL_EMBARCADO
+resident TMP_FATO
+where TIPO = 'EMBARCADO'
+group by
+	[Número da requisição],
+    %MATERIAL_CHAVE;
+    
+Map_qtd_embarcado:
+mapping load
+	[%CHAVE_REQUISICAO],
+    QTD_TOTAL_EMBARCADO
+resident tmp_qtd_embarcado;
+
+drop table tmp_qtd_embarcado;
+
+/**************************
+//NÃO ATENDIDA
+**************************/
+NoConcatenate
+tmp_dat_embarcado:
+Load
+	[Número da requisição],
+    date(max(DAT_EMBARCADO)) as TMP_DAT_EMBARCADO
+Resident TMP_FATO
+where TIPO = 'EMBARCADO'
+group by 
+	[Número da requisição];
+
+left join (EBAN)
+Load 
+	[Número da requisição] as BANFN,
+    TMP_DAT_EMBARCADO
+Resident tmp_dat_embarcado;
+drop table tmp_dat_embarcado;
+    
+Concatenate (TMP_FATO)
+Load 
+	*,
+	QTD_TOTAL_REQUISICAO-QTD_TOTAL_EMBARCADO as QTD_NAO_ATENDIDA
+    where QTD_TOTAL_REQUISICAO <> QTD_TOTAL_EMBARCADO;
+Load 
+   	alt(sum(MENGE),0) as QTD_TOTAL_REQUISICAO,
+    RESWK as [CD ORIGEM],
+    MATNR as %MATERIAL_CHAVE,
+    VBELN as [Número da remessa],
+    BANFN as [Número da requisição],
+    EBELN as [Número do Pedido],
+    ApplyMap('Map_qtd_embarcado',BANFN&'|'&MATNR,0) as QTD_TOTAL_EMBARCADO,
+    date(max(TMP_DAT_EMBARCADO)) as [%DATA_CHAVE]
+resident EBAN
+where not IsNull(TMP_DAT_EMBARCADO)
+group by
+    RESWK,
+    MATNR,
+    VBELN,
+    BANFN,
+    EBELN;
+
+left join (TMP_FATO)
+Load distinct
+    BANFN as [Número da requisição],
+	BSART
+resident EBAN;
+drop table EBAN;
+
+// /**************************
+//  CROSS
+// **************************/
+
+ZWMUCT006:
+load 
+	EXIDV,
+	EBELN,
+    CDORIGEM as [CD ORIGEM],
+    VBELN_1 as VBELN,
+    VBELN_1,
+    null() as VBELN_2,
+    null() as VBELN_3,
+	DTENT_1 as %DATA_CHAVE,
+    VBELN_1_DT as DAT_CRIACAO_REMESSA,
+//     WERKS as %CENTRO_CHAVE_CROSS,
+    if(match(CDSECUNDARIO, '1156','1075'),
+		CDSECUNDARIO,
+		if(match(CDHUB, '1117'),
+        	CDHUB,
+			WERKS)) as  %CENTRO_CHAVE_CROSS,
+    CDSECUNDARIO AS [CD SECUNDARIO],
+    CDHUB as [CD HUB]
+from [$(vGlobalDirDadoExtraidoSAPECC)/Períodos/ZWMUCT006_ATUAL.qvd] (qvd)
+where TPPROCESSO = 'CK' 
+	or (TPPROCESSO = 'BF' and CDORIGEM = '1075' and Match(WERKS, '6000','7000')) or (TPPROCESSO = 'BF' and CDORIGEM = '1156' and Match(WERKS, '6000','8000'))
+	or (TPPROCESSO = 'PP' and CDORIGEM = '1075' and Match(WERKS, '1156','1117')) or (TPPROCESSO = 'PP' and CDORIGEM = '1156' and Match(WERKS, '1075','1117'));
+
+Concatenate (ZWMUCT006)
+load 
+	EXIDV,
+	EBELN,
+    CDSECUNDARIO as [CD ORIGEM],
+    VBELN_2 as VBELN,
+    null() as VBELN_1,
+    VBELN_2,
+    null() as VBELN_3,
+	DTENT_2 as %DATA_CHAVE,
+    VBELN_2_DT as DAT_CRIACAO_REMESSA,
+    WERKS as %CENTRO_CHAVE_CROSS
+from [$(vGlobalDirDadoExtraidoSAPECC)/Períodos/ZWMUCT006_ATUAL.qvd] (qvd)
+where TPPROCESSO = 'CK' and trim(CDSECUNDARIO) <> '';
+
+Concatenate (ZWMUCT006)
+load 
+	EXIDV,
+	EBELN,
+    CDHUB as [CD ORIGEM],
+    VBELN_3 as VBELN,
+    null() as VBELN_1,
+    null() as VBELN_2,
+    VBELN_3,
+	DTENT_3 as %DATA_CHAVE,
+    VBELN_3_DT as DAT_CRIACAO_REMESSA,
+    WERKS as %CENTRO_CHAVE_CROSS
+from [$(vGlobalDirDadoExtraidoSAPECC)/Períodos/ZWMUCT006_ATUAL.qvd] (qvd)
+where TPPROCESSO = 'CK' and CDHUB = '1117';
+
+MAP_DATA_ENTRADA_CD:
+NoConcatenate
+load
+	VBELN&EBELN as %CHAVE_DATA_ENTRADA,
+	%DATA_CHAVE as DATA_ENTRADA
+resident ZWMUCT006;
+   
+//Quantidade
+MAP_LOTE:
+Mapping 
+Load
+	PACKNR                       AS COD_PACOTE,           // Número do Pacote
+    '00000000'&right(POBJID,10)             AS COD_OBJETO_PACOTE
+from [lib://CNNDIR-DadosDEV/Temporários/Pablo_Projjetta/PACKKP.qvd](QVD);
+
+NoConcatenate
+VEKP:
+Load
+	text(ApplyMap('MAP_LOTE',PACKVORSCHR,null())) as Norma_Embalagem,
+	EXIDV, 
+    PACKVORSCHR,
+    if(left(right(ApplyMap('MAP_LOTE',PACKVORSCHR,null()),3),1) = 0, 12) as tmp_qtd
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/VEKP.qvd](qvd);
+
+left join (VEKP)
+Load
+    text(MATNR) as Norma_Embalagem,
+    STLNR as Lista_Tecnica
+from [$(vGlobalDirDadoExtraidoSAPECC)/MAST.qvd] (qvd);
+
+left join (VEKP)
+Load 
+	STLNR as Lista_Tecnica,
+    MENGE as QTD_1,
+    IDNRK as %MATERIAL_CHAVE
+from [$(vGlobalDirDadoExtraidoSAPECC)/STPO.qvd] (qvd);
+
+
+left join (ZWMUCT006)
+Load 
+	EXIDV,
+    Lista_Tecnica,
+    if(isnull(QTD_1),tmp_qtd,QTD_1) as QTD,
+    %MATERIAL_CHAVE
+resident VEKP;
+
+drop table VEKP;
+
+// /**************************
+// Solicitado CROSS
+// **************************/
+
+NoConcatenate
+temp_ZWMUCT006:
+Load *
+resident ZWMUCT006
+where /*not Exists(VBELN_FILTRO, VBELN) and*/ trim(VBELN) = ''
+;
+
+inner join (temp_ZWMUCT006)
+Load
+	EBELN
+from [$(vGlobalDirDadoExtraidoSAPECC)/EKKO.qvd] (qvd)
+where Exists(EBELN) and match(BSART, 'ZFAZ', 'ZFFZ', 'ZINZ', 'ZMAZ');
+
+Concatenate (TMP_FATO)
+Load 
+	EXIDV,
+    %MATERIAL_CHAVE,
+    [%DATA_CHAVE],
+    EBELN as [Número do Pedido],
+    VBELN as [Número da remessa],
+    'CROSS' as TMP_ORIGEM,
+    'REQUISIÇÃO' as TIPO,
+    [CD ORIGEM],
+    QTD,
+    QTD as QTD_SOLICITADA
+resident temp_ZWMUCT006
+where not match([CD ORIGEM], '1156','1117') and not IsNull([%DATA_CHAVE]);
+
+drop table temp_ZWMUCT006;
+
+/**************************
+Finalizado CROSS
+**************************/
+NoConcatenate
+ZTBWM026:
+Load distinct
+	VBELN as [Remessa_Cross_embarcar],
+    DATA_FIM_PED
+from [$(vGlobalDirDadoExtraidoSAPECC)/ZTBWM026.qvd] (qvd)
+where not IsNull(DATA_FIM_PED) and trim(DATA_FIM_PED) <> '';
+
+join(ZTBWM026)
+Load 
+	VBELN_TRANSF as [Remessa_Cross_embarcar],
+    Alt(DT_PROC_TRANSF_NEW,DT_PROC_TRANSF) as DATA_TRANSF,
+    1 as flag_campanha
+from [$(vGlobalDirDadoExtraidoSAPECC)/Períodos/ZWMUCT016.qvd] (qvd);
+
+MapDatFimPedido:
+Mapping Load
+	[Remessa_Cross_embarcar],
+    alt(DATA_TRANSF, DATA_FIM_PED)
+resident ZTBWM026;
+
+temp:
+Load 
+	EXIDV,
+	VBELN as [Número da remessa],
+    VBELN as [Remessa Finalizada],
+	EBELN as [Número do Pedido],
+    %MATERIAL_CHAVE,
+    [CD ORIGEM],
+    QTD,
+    QTD as QTD_EMBARCADO,
+    %CENTRO_CHAVE_CROSS,
+	ApplyMap('MapDatFimPedido', VBELN, null()) as TMP_DAT_FINALIZADO,
+    'EMBARCADO' as TIPO,
+    'CROSS' as TMP_ORIGEM
+resident ZWMUCT006;
+
+inner join (temp)
+Load 
+	VBELN_FILTRO as [Número da remessa],
+    min(ERDAT) as %DATA_CHAVE,
+    date(min(ERDAT)) as DAT_EMBARCADO
+resident Embarcadas
+group by VBELN_FILTRO;
+
+Concatenate (TMP_FATO)
+Load 
+	*,
+    alt(TMP_DAT_FINALIZADO, %DATA_CHAVE) as DAT_FINALIZADO
+Resident temp;
+
+/**************************
+À EMBARCAR CROSS
+**************************/
+
+
+Concatenate (TMP_FATO)
+Load 
+	EXIDV,
+	VBELN as [Número da remessa],
+	EBELN as [Número do Pedido],
+    VBELN as [Filtro_Remessa_Cross_embarcar],
+    %MATERIAL_CHAVE,
+    [CD ORIGEM],
+    QTD,
+    QTD as QTD_FINALIZADO,
+    [CD SECUNDARIO],
+	[CD HUB],
+    alt(ApplyMap('MapDatFimPedido', VBELN, null()),DAT_CRIACAO_REMESSA) as DAT_FINALIZADO,
+    alt(ApplyMap('MapDatFimPedido', VBELN, null()),DAT_CRIACAO_REMESSA) as %DATA_CHAVE,
+    %CENTRO_CHAVE_CROSS,
+    'À EMBARCAR' as TIPO,
+    'CROSS' as TMP_ORIGEM
+resident ZWMUCT006
+where 
+(
+    (
+        ([CD ORIGEM] = '1075' 
+         and ([CD SECUNDARIO]='1156' or [CD HUB] = '1117'))
+        or exists([Remessa_Cross_embarcar], VBELN)
+        or match([CD ORIGEM], '1156','1117')
+    )
+    and 
+    not Exists([Remessa Finalizada], VBELN)
+    and trim(VBELN) <> ''
+);
+/**************************
+Produção CROSS
+**************************/
+NoConcatenate
+LIKP:
+Load
+	VBELN,
+    VBELN as VBELN_PRODUCAO,
+    ANZPK as VOLUME_PRODUCAO,
+//     KUNNR as %CENTRO_DESTINO,
+    date(ERDAT) as DAT_PRODUCAO
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/LIKP.qvd] (qvd)
+where not Exists(VBELN_FILTRO, VBELN) and LFART = 'YFDT' and match(VSTEL, '1075', '1156' ,'1117') and not match(SPE_LOEKZ,'X');
+
+inner join (LIKP)
+Load
+	VBELN
+FROM [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/LIPS.qvd] (qvd)
+where LGORT = '0005';
+
+MAP_DAT_PROD:
+Mapping load
+	VBELN,
+	DAT_PRODUCAO
+resident LIKP;
+
+MAP_VOLUME_PROD:
+Mapping load
+	VBELN,
+	VOLUME_PRODUCAO
+resident LIKP;
+
+Concatenate (TMP_FATO)
+Load 
+	EXIDV,
+	VBELN as [Número da remessa],
+	EBELN as [Número do Pedido],
+    %MATERIAL_CHAVE,
+    [CD ORIGEM],
+    QTD,
+    QTD as QTD_PRODUCAO,
+    alt(ApplyMap('MAP_DAT_PROD',VBELN, null()),%DATA_CHAVE) as %DATA_CHAVE,
+    %CENTRO_CHAVE_CROSS,
+    'PRODUÇÃO' as TIPO,
+    'CROSS' as TMP_ORIGEM
+resident ZWMUCT006
+where (Exists(VBELN_PRODUCAO, VBELN) or match([CD ORIGEM],'1156','1117')) and not IsNull([%DATA_CHAVE]) and not Exists([Remessa Finalizada], VBELN) and not Exists(Filtro_Remessa_Cross_embarcar, VBELN);
+//([CD ORIGEM] = '1075' and ([CD SECUNDARIO]='1156' or [CD HUB] = '1117'));
+
+drop table LIKP;
+
+drop Fields Filtro_Remessa_Cross_embarcar, [Remessa Finalizada];
+
+
+drop tables Embarcadas, temp, ZWMUCT006;
+
+// store TMP_FATO into  [lib://CNNDIR-DadosDEV/Temporários/Pablo_Projjetta/TMP_FATO_PCP.qvd](QVD);
+
+MAP_VOLUME_PROD:
+mapping Load
+	VBELN,
+    ANZPK as VOLUME_PRODUCAO
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/LIKP.qvd] (qvd);
+
+MAP_Dat_Producao:
+mapping Load
+	VBELN,
+    date(ERDAT) as DAT_PRODUCAO
+from [lib://CNNDIR-Dados/Extraídos/SAP ECC/LOG-LEADTIME/LIKP.qvd] (qvd)
+where Exists([Número da remessa], VBELN);
+
+NoConcatenate
+FATO:
+Load
+	*,
+    %CENTRO_CHAVE&'|'&(num(weekday([Data de Referência]))+1) as %CHAVE_CAPACIDADE_DIA
+where not WildMatch(%CENTRO_CHAVE, '9???', '1119') or IsNull(%CENTRO_CHAVE) // Excluindo lojas novas e ecommerce mas mantendo requisições sem loja destino
+;
+
+Load
+	*,
+	if(CD_ABASTECEDOR = [CD ORIGEM],
+		%CENTRO_CHAVE_TMP,
+        CD_ABASTECEDOR) as %CENTRO_CHAVE,
+        
+    if((AGE_EMBARQUE)<=2,
+		'<= 2D',
+    	if((AGE_EMBARQUE)<=4,
+    		'>= 3D <= 4D',
+    		if((AGE_EMBARQUE) <= 7,
+				'>= 5D <= 7D',
+                if((AGE_EMBARQUE) > 7,
+                	'> 7D'
+		)))) as [Faixa Age Embarque],
+        
+    if((AGE_PRODUCAO)<=2,
+		'<= 2D',
+    	if((AGE_PRODUCAO)<=4,
+    		'>= 3D <= 4D',
+    		if((AGE_PRODUCAO) <= 7,
+				'>= 5D <= 7D',
+                if((AGE_PRODUCAO) > 7,
+                	'> 7D'
+		)))) as [Faixa Age Produção]
+;
+Load
+	*,
+    ApplyMap('MapCDAbastecedor',%CENTRO_CHAVE_TMP,NULL()) as CD_ABASTECEDOR,
+    (today()-[Data de Referência]) as dias_referencia,
+// 	Year([%DATA_CHAVE])&Week([%DATA_CHAVE], 0, 0, 0)&ApplyMap('MapPlanoProducao',ORIGEM,null())&[CD ORIGEM] as %CHAVE_PLANO_PRODUCAO,
+    ApplyMap('MapPlanoProducao',ORIGEM,null()) as GRUPO_PLANO_PRODUCAO,
+    DAT_EMBARCADO - DAT_FINALIZADO as AGE_EMBARQUE,
+    DAT_FINALIZADO - DAT_PRODUCAO_HISTORICO as AGE_PRODUCAO
+;
+load 
+	*,
+    today() as DAT_FOTOGRAFIA,
+    if(TMP_ORIGEM = 'CROSS',
+    	%CENTRO_CHAVE_CROSS,
+        ApplyMap('Map_destino', [Número da requisição], NULL())) as %CENTRO_CHAVE_TMP,
+    alt(date([%DATA_CHAVE],'DD/MM/YYYY'),today()) as [Data de Referência],
+    ApplyMap('MapArvore',%MATERIAL_CHAVE,null()) as %ARVORE_CHAVE,
+    alt(ApplyMap('MAP_VOLUME_PROD',[Número da remessa], null()),0) as VOLUME_PRODUCAO,
+    num(Right([Número da requisição],8)) as [Código da requisição],
+    num(Right([Número da remessa],8)) as [Código da remessa],
+    date(alt(ApplyMap('MAP_DATA_ENTRADA_CD',[Número da remessa]&[Número do Pedido], null()),  ApplyMap('MAP_Dat_Producao', [Número da remessa], null()))) as DAT_PRODUCAO_HISTORICO,
+	if(match(BSART, 'ZBF'),
+		'BUFFER',
+		if(match(BSART, 'ZMD','ZFT'),
+			'ACESSÓRIOS',
+			if(match(AUX, 'PP') or match(BSART, 'ZSKU'),
+				'PUSH & PULL',
+				TMP_ORIGEM))) as ORIGEM,
+	if(match(BSART, 'ZMD'),
+		'Ressuprimento acessórios',
+        if(match(BSART, 'ZFT'),
+        	'Primeiro envio')) as TIPO_ENVIO_ACESSORIOS
+Resident TMP_FATO;
+drop table TMP_FATO;
+
+drop field AUX;
+
+NoConcatenate
+Fato_PCP:
+load
+	*
+from [lib://CNNDIR-DadosDEV/Temporários/Pablo_Projjetta/Fato_PCP.qvd](qvd)
+where DAT_FOTOGRAFIA >= Date(today()-15) and DAT_FOTOGRAFIA < today();
+
+Concatenate (Fato_PCP)
+Load 
+	*
+resident FATO
+where DAT_FOTOGRAFIA = today();
+
+store Fato_PCP into [lib://CNNDIR-DadosDEV/Temporários/Pablo_Projjetta/Fato_PCP.qvd](qvd);
+drop table Fato_PCP;
+
+Recebimento_tmp_1:
+Crosstable(DIA_CAMPO, FLAG_RECEBE, 1)
+Load 
+	text(KUNNR) as %CENTRO_CHAVE, 
+	DIA_RECEB_SEG, 
+	DIA_RECEB_TER, 
+	DIA_RECEB_QUA, 
+	DIA_RECEB_QUI, 
+	DIA_RECEB_SEX, 
+	DIA_RECEB_SAB, 
+	DIA_RECEB_DOM
+from [$(vGlobalDirDadoExtraidoSAPECC)/ZTM0009.qvd] (qvd);
+
+NoConcatenate
+Recebimento_tmp_2:
+Load
+	%CENTRO_CHAVE,
+	DIA_CAMPO,
+    Match(DIA_CAMPO,
+        'DIA_RECEB_SEG',
+        'DIA_RECEB_TER',
+        'DIA_RECEB_QUA',
+        'DIA_RECEB_QUI',
+        'DIA_RECEB_SEX',
+        'DIA_RECEB_SAB',
+        'DIA_RECEB_DOM'
+    ) +1 as NR_DIA_SEMANA
+resident Recebimento_tmp_1
+where FLAG_RECEBE = 'X';
+drop table Recebimento_tmp_1;
+
+left join (Recebimento_tmp_2)
+Load
+	text(WERKS) as %CENTRO_CHAVE,
+	num(right(CAPRC,5)) as CAPACIDADE
+from [$(vGlobalDirDadoExtraidoSAPECC)/YTBW_CR_0001.qvd] (qvd);
+
+Dim_Capacidade_Recebimento:
+Load
+	%CENTRO_CHAVE,
+	sum(CAPACIDADE) as CAPACIDADE_SEMANA
+resident Recebimento_tmp_2
+group by 
+	%CENTRO_CHAVE;
+    
+Dim_Capacidade_Recebimento_Dia:
+Load
+	%CENTRO_CHAVE&'|'&NR_DIA_SEMANA as %CHAVE_CAPACIDADE_DIA,
+    CAPACIDADE as CAPACIDADE_DIA
+resident Recebimento_tmp_2;   
+    
+drop table Recebimento_tmp_2;
+
+[Calendário Comercial]:
+LOAD Distinct
+    DAT_CALENDARIO_CIVIL								                                AS [Data de Referência],
+    date(DAT_CALENDARIO_CIVIL,'DD/MMM')                  								AS [Data de Referência Resumida],
+    day(DAT_CALENDARIO_CIVIL)                                                           AS [Dia do Mês],
+    TIPO															                    AS [Tipo_Data],
+    NUM_DIA_SEMANA                                                                      AS [Dia da Semana],
+    If(DAT_CALENDARIO_CIVIL=(Today()-1) 
+      or NUM_DIA_SEMANA=7,1,Null())                                                     AS [Flag Último Dia Semana],
+    If(DAT_CALENDARIO_CIVIL=(Today()-1) 
+      or NUM_DIA_SEMANA_GIRO=7,1,Null())                                                AS [Flag Último Dia Semana Giro],      
+    NUM_SEMANA		                                                                    AS [Número da Semana],
+    Dual(NUM_SEMANA&'/'&Year(DAT_CALENDARIO),
+         Num(Year(DAT_CALENDARIO)&NUM_SEMANA))                                          AS [Semana/Ano],
+    DAT_CALENDARIO 											                            AS [%Data Comercial],
+    Year(DAT_CALENDARIO)&' - '&NUM_SEMANA&' - '&NUM_DIA_SEMANA                          AS [Ano Semana Dia],
+    Year([DAT_CALENDARIO_CIVIL])                      				                    AS [Ano Civil],
+    Year([DAT_CALENDARIO])					    				                	    AS [Ano Comercial],
+    Month([DAT_CALENDARIO_CIVIL])			            			                    AS [Mês Civil],
+    Month([DAT_CALENDARIO])					        				                    AS [Mês Comercial],
+    Date([DAT_CALENDARIO_CIVIL],'MM/YYYY')							                    AS [Mês Ano Civil],
+    Date([DAT_CALENDARIO],'MM/YYYY')								                    AS [Mês Ano Comercial],
+    If((Num(AsOfDate)<=Num((Today()-7))) and (Num(AsOfDate)>=Num((Today()-56))),1,0) AS [Flag 8 Semanas tmp]
+////MM002 - Fim  
+FROM [$(vGlobalDirDadoTransformado)/Dim_Calendario_Comercial_Asof_Cubo.qvd] (qvd)
+Where DAT_CALENDARIO_CIVIL >= AddMonths(Today(),-6) and DAT_CALENDARIO_CIVIL <= AddMonths(Today(),1) and TIPO = 'Dia Ano Atual';
+/*Exists([Data de Referência],DAT_CALENDARIO_CIVIL)*/ 
+
+MapDatSemana:
+mapping load
+	[Ano Comercial]&'|'&[Número da Semana],
+	max([Data de Referência]) as [Data de Referência]
+resident [Calendário Comercial]
+group by 
+	[Ano Comercial],
+	[Número da Semana];
+
+
+[CALENDÁRIO PRODUÇÃO]:
+LOAD Distinct
+	DAT_CALENDARIO_CIVIL 																as DAT_FINALIZADO,
+    DAT_CALENDARIO_CIVIL								                                AS [Produção Data],
+    date(DAT_CALENDARIO_CIVIL,'DD/MMM')                  								AS [Produção Data de Referência Resumida],
+    day(DAT_CALENDARIO_CIVIL)                                                           AS [Produção Dia do Mês],
+    TIPO															                    AS [Produção Tipo_Data],
+    NUM_DIA_SEMANA                                                                      AS [Produção Dia da Semana],   
+    NUM_SEMANA		                                                                    AS [Produção Número da Semana],
+    Dual(NUM_SEMANA&'/'&Year(DAT_CALENDARIO),
+         Num(Year(DAT_CALENDARIO)&NUM_SEMANA))                                          AS [Produção Semana/Ano],
+    DAT_CALENDARIO 											                            AS [Produção %Data Comercial],
+    Year(DAT_CALENDARIO)&' - '&NUM_SEMANA&' - '&NUM_DIA_SEMANA                          AS [Produção Ano Semana Dia],
+    Year([DAT_CALENDARIO_CIVIL])                      				                    AS [Produção Ano Civil],
+    Year([DAT_CALENDARIO])					    				                	    AS [Produção Ano Comercial],
+    Month([DAT_CALENDARIO_CIVIL])			            			                    AS [Produção Mês Civil],
+    Month([DAT_CALENDARIO])					        				                    AS [Produção Mês Comercial],
+    Date([DAT_CALENDARIO_CIVIL],'MM/YYYY')							                    AS [Produção Mês Ano Civil],
+    Date([DAT_CALENDARIO],'MM/YYYY')								                    AS [Produção Mês Ano Comercial]
+////MM002 - Fim  
+FROM [$(vGlobalDirDadoTransformado)/Dim_Calendario_Comercial_Asof_Cubo.qvd] (qvd)
+Where DAT_CALENDARIO_CIVIL >= AddMonths(Today(),-2) and DAT_CALENDARIO_CIVIL <= AddMonths(Today(),1) and TIPO = 'Dia Ano Atual';
+
+Unqualify;
+
+Concatenate(FATO)
+// DIM_PLANO:
+load
+//     MÊS,
+//     ANO,
+//     SEMANA,
+    GRUPO as GRUPO_PLANO_PRODUCAO,
+    text(CD) as [CD ORIGEM],
+	date(ApplyMap('MapDatSemana',ANO&'|'&SEMANA, null())) as DAT_FINALIZADO,
+    PLANO
+//     ANO&SEMANA&GRUPO&num(CD) as %CHAVE_PLANO_PRODUCAO
+from [lib://CNNDIR-Dados/Extraídos/GoogleDrive/Logistica/Abastecimento/BASE PLANO PRODUCAO.qvd](QVD)
+where ANO >= 2026;
+
+left join(FATO)
+load
+    text(CD) as [CD ORIGEM],
+    GRUPO as GRUPO_PLANO_PRODUCAO,
+    Início,
+    Fim
+from [lib://CNNDIR-Dados/Extraídos/GoogleDrive/Logistica/Abastecimento/BASE HORARIO PRODUCAO.qvd](QVD);
+
+Dim_Material:
+LOAD
+    COD_MATERIAL	AS %MATERIAL_CHAVE,
+    DES_MATERIAL	AS [Material - Descrição],
+	num(Right(COD_MATERIAL,10)) as [Material - Código],
+    COD_MATERIAL_PAI as [Material Pai - Código],
+	If(Len(COD_MATERIAL_PAI)<2, DES_MATERIAL, left(DES_MATERIAL, index(DES_MATERIAL, ',') -1)) as [Material Pai - Descrição]
+FROM [lib://CNNDIR-Dados/Transformados/Dim_Material.qvd](qvd);
+
+Dim_Arvore:
+LOAD
+    COD_CHAVE_ARVORE                               as %ARVORE_CHAVE,
+    DES_SUB_GRUPO                                  AS [Material - Subgrupo],
+    DES_GRUPO                                      AS [Material - Grupo],
+    DES_SUB_SEGMENTO                               AS [Material - Subsegmento],
+    DES_SEGMENTO                                   AS [Material - Segmento],
+    DES_DEPARTAMENTO                               AS [Material - Departamento],
+    DES_ORGANIZACAO                                AS [Material - Organização],
+    COD_TIPO_FAIXA_PRECO                           AS [Material - Código Faixa de Preço],
+    DES_FAIXA_PRECO                                AS [Material - Faixa de Preço],
+    IND_STATUS                                     AS [Material - Status],
+    DES_GRUPO_COMPRADOR                            AS [Material - Grupo Comprador],
+    DES_COMPRADOR                                  AS [Material - Comprador],
+    DES_FAB_MIT                                    AS [FAB/MIT],
+    DES_DEPARTAMENTO&' - '&DES_SEGMENTO&' - '&DES_SUB_SEGMENTO&' - '&DES_GRUPO&' - '&DES_SUB_GRUPO AS [Árvore - Descrição]
+FROM [lib://CNNDIR-Dados/Transformados/Dim_Arvore_Mercadologica_Cubo.qvd] (qvd)
+WHERE Exists(%ARVORE_CHAVE, COD_CHAVE_ARVORE);
+
+Loja:
+LOAD  
+    *,
+    [Loja - Código] as %CENTRO_CHAVE,
+    Coalesce([Loja - Descrição],COD_DES_CENTRO) as [Lojas + Depositos]
+FROM  [$(vGlobalDirDadoTransformado)/Dim_Loja_Compras.qvd] (qvd)
+WHERE Exists(%CENTRO_CHAVE, [Loja - Código]);
